@@ -34,7 +34,18 @@ router = APIRouter(prefix="/api")
 
 
 def _handle_domain(exc: DomainError) -> None:
-    raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    if isinstance(exc, ConflictError):
+        # 409 冲突：结构化 detail，前端据此区别于 400 普通参数错误 / 422 校验错误，
+        # 并能拿到 current_version 刷新投影后带新版本重试。
+        detail: dict | str = {
+            "code": exc.code,
+            "message": exc.message,
+            "current_version": exc.current_version,
+            "expected_version": exc.expected_version,
+        }
+    else:
+        detail = exc.message
+    raise HTTPException(status_code=exc.status_code, detail=detail)
 
 
 @router.get("/health")

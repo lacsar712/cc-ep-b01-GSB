@@ -60,6 +60,45 @@
       </div>
     </div>
 
+    <n-alert
+      v-if="conflict && conflict.kind === 'version_conflict'"
+      type="warning"
+      title="版本冲突：页面上的投影版本已过期"
+      :bordered="false"
+      style="margin-bottom: 16px"
+    >
+      <div>
+        「{{ conflict.label }}」未写入：你基于版本
+        <b>{{ conflict.staleVersion }}</b> 提交，但服务器当前已是版本
+        <b>{{ conflict.serverVersion }}</b>。投影版本号已自动刷新，表单内容已保留，
+        请先核对他人刚写入的指标/产物，再用新版本重试。
+      </div>
+      <template #action>
+        <n-button size="small" type="warning" :loading="busy" @click="retryLast">
+          用版本 {{ conflict.serverVersion }} 重试
+        </n-button>
+        <n-button size="small" quaternary style="margin-left: 8px" @click="dismissConflict">
+          知道了
+        </n-button>
+      </template>
+    </n-alert>
+
+    <n-alert
+      v-else-if="conflict && conflict.kind === 'terminal_state'"
+      type="error"
+      title="Run 已在他处结束，命令无法写入"
+      :bordered="false"
+      style="margin-bottom: 16px"
+    >
+      <div>
+        「{{ conflict.label }}」未写入：该 Run 已被其他操作置为终态（当前状态：{{ statusLabel }}，
+        版本 {{ conflict.serverVersion }}），刷新版本也不能再提交。
+      </div>
+      <template #action>
+        <n-button size="small" quaternary @click="dismissConflict">知道了</n-button>
+      </template>
+    </n-alert>
+
     <div v-if="canWrite" class="card">
       <h3 style="margin-top: 0">命令操作区（乐观锁 expected_version = {{ run.version }}）</h3>
       <div class="grid-2">
@@ -92,7 +131,9 @@
         <n-button type="warning" :loading="busy" @click="doAbort">AbortRun</n-button>
       </div>
     </div>
-    <div v-else class="card muted">审计员只读：可查看事件与血缘，不可发送命令。</div>
+    <div v-else class="card muted">
+      当前为只读视图{{ auth.role === 'auditor' ? '（审计员）' : '' }}：仅研究员对「进行中」的 Run 可发送命令。
+    </div>
   </div>
 </template>
 
@@ -116,6 +157,10 @@ const run = ref(null)
 const busy = ref(false)
 const completeSummary = ref('')
 const abortReason = ref('')
+// 最近一次版本冲突状态；null 表示无冲突。区别于普通参数错误（走 message.error 浮层）。
+const conflict = ref(null)
+// 最近一次成功捕获的命令描述符，供冲突后“用新版本重试”。
+const lastCommand = ref(null)
 
 const metric = reactive({ name: 'loss', value: 0.5, step: 1 })
 const artifact = reactive({
@@ -159,29 +204,118 @@ async function load() {
   run.value = await getRun(route.params.id)
 }
 
-async function withBusy(fn) {
+// 命令表：版本号在真正发出时才读取，冲突自动刷新投影后，重试天然带上新版本。
+// 每个命令携带 label，用于冲突告警与成功提示。
+const COMMANDS = {
+  metric: () => ({
+    label: '记录指标',
+    exec: (version) =>
+      recordMetric(run.value.id, {
+        name: metric.name,
+        value: metric.value,
+        step: metric.step,
+        expected_version: version,
+      }),
+  }),
+  artifact: () => ({
+    label: '挂载产物',
+    exec: (version) =>
+      attachArtifact(run.value.id, { ...artifact, expected_version: version }),
+  }),
+  complete: () => ({
+    label: '完成 Run',
+    exec: (version) =>
+      completeRun(run.value.id, {
+        result_summary: completeSummary.value,
+        expected_version: version,
+      }),
+  }),
+  abort: () => ({
+    label: '中止 Run',
+    exec: (version) =>
+      abortRun(run.value.id, {
+        reason: abortReason.value,
+        expected_version: version,
+      }),
+  }),
+}
+
+async function runCommand(kind) {
+  const descriptor = COMMANDS[kind]()
+  lastCommand.value = { kind, label: descriptor.label }
+  conflict.value = null
   busy.value = true
   try {
-    await fn()
-    message.success('命令已接受')
+    await descriptor.exec(run.value.version)
+    message.success(`「${descriptor.label}」已接受，投影已更新`)
     await load()
+    if (kind === 'metric') metric.step += 1
   } catch (e) {
-    message.error(e.message || '命令失败')
+    if (e?.isConflict) {
+      // 409：与普通参数错误明确区分。自动刷新投影版本号后，允许带新版本再提交。
+      const staleVersion = e.expectedVersion ?? run.value.version
+      await refreshAfterConflict(staleVersion)
+      conflict.value = {
+        kind: e.errorCode === 'terminal_state' ? 'terminal_state' : 'version_conflict',
+        label: descriptor.label,
+        staleVersion,
+        serverVersion: run.value?.version ?? e.currentVersion ?? staleVersion,
+      }
+    } else {
+      // 400/422 等普通参数错误：浮层提示，不改动投影版本。
+      message.error(e.message || '命令失败')
+    }
   } finally {
     busy.value = false
   }
 }
 
+async function refreshAfterConflict(staleVersion) {
+  try {
+    await load()
+    message.info(
+      `检测到版本冲突，已自动刷新：版本 ${staleVersion} → ${run.value?.version}`,
+    )
+  } catch (e) {
+    message.error(e.message || '冲突后刷新投影失败，请手动刷新页面')
+  }
+}
+
+async function retryLast() {
+  if (!lastCommand.value || !run.value) return
+  const descriptor = COMMANDS[lastCommand.value.kind]()
+  conflict.value = null
+  busy.value = true
+  try {
+    await descriptor.exec(run.value.version)
+    message.success(`「${descriptor.label}」已用新版本 ${run.value.version} 写入成功`)
+    await load()
+    if (lastCommand.value.kind === 'metric') metric.step += 1
+    lastCommand.value = null
+  } catch (e) {
+    if (e?.isConflict) {
+      const staleVersion = e.expectedVersion ?? run.value.version
+      await refreshAfterConflict(staleVersion)
+      conflict.value = {
+        kind: e.errorCode === 'terminal_state' ? 'terminal_state' : 'version_conflict',
+        label: descriptor.label,
+        staleVersion,
+        serverVersion: run.value?.version ?? e.currentVersion ?? staleVersion,
+      }
+    } else {
+      message.error(e.message || '重试失败')
+    }
+  } finally {
+    busy.value = false
+  }
+}
+
+function dismissConflict() {
+  conflict.value = null
+}
+
 function doMetric() {
-  return withBusy(async () => {
-    await recordMetric(run.value.id, {
-      name: metric.name,
-      value: metric.value,
-      step: metric.step,
-      expected_version: run.value.version,
-    })
-    metric.step += 1
-  })
+  return runCommand('metric')
 }
 
 function doArtifact() {
@@ -189,12 +323,7 @@ function doArtifact() {
     message.warning('请填写 64 位 content_sha256')
     return
   }
-  return withBusy(() =>
-    attachArtifact(run.value.id, {
-      ...artifact,
-      expected_version: run.value.version,
-    }),
-  )
+  return runCommand('artifact')
 }
 
 function doComplete() {
@@ -202,12 +331,7 @@ function doComplete() {
     message.warning('请填写完成摘要')
     return
   }
-  return withBusy(() =>
-    completeRun(run.value.id, {
-      result_summary: completeSummary.value,
-      expected_version: run.value.version,
-    }),
-  )
+  return runCommand('complete')
 }
 
 function doAbort() {
@@ -215,12 +339,7 @@ function doAbort() {
     message.warning('请填写中止原因')
     return
   }
-  return withBusy(() =>
-    abortRun(run.value.id, {
-      reason: abortReason.value,
-      expected_version: run.value.version,
-    }),
-  )
+  return runCommand('abort')
 }
 
 onMounted(async () => {

@@ -22,7 +22,15 @@ api.interceptors.response.use(
       err.message = detail
     } else if (Array.isArray(detail)) {
       err.message = detail.map((d) => d.msg || JSON.stringify(d)).join('; ')
+    } else if (detail && typeof detail === 'object') {
+      // 结构化冲突体：{ code, message, current_version, expected_version }
+      err.message = detail.message || '请求冲突'
+      err.errorCode = detail.code
+      err.currentVersion = detail.current_version
+      err.expectedVersion = detail.expected_version
     }
+    err.status = err.response?.status
+    err.isConflict = err.response?.status === 409
     return Promise.reject(err)
   },
 )
