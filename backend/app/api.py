@@ -34,6 +34,16 @@ router = APIRouter(prefix="/api")
 
 
 def _handle_domain(exc: DomainError) -> None:
+    if isinstance(exc, ConflictError):
+        # 结构化 409：前端凭 code 区分版本冲突/终态与普通参数错误，并可取 current_version 自动恢复
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={
+                "code": exc.code,
+                "message": exc.message,
+                "current_version": exc.current_version,
+            },
+        )
     raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
 

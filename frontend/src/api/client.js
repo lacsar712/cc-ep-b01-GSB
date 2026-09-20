@@ -17,12 +17,20 @@ api.interceptors.request.use((config) => {
 api.interceptors.response.use(
   (res) => res,
   (err) => {
+    const status = err.response?.status
     const detail = err.response?.data?.detail
     if (typeof detail === 'string') {
       err.message = detail
     } else if (Array.isArray(detail)) {
       err.message = detail.map((d) => d.msg || JSON.stringify(d)).join('; ')
+    } else if (detail && typeof detail === 'object') {
+      // 结构化冲突：{ code, message, current_version }
+      err.message = detail.message || JSON.stringify(detail)
+      err.code = detail.code
+      err.currentVersion = detail.current_version
     }
+    err.status = status
+    err.isConflict = status === 409
     return Promise.reject(err)
   },
 )

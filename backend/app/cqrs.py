@@ -22,8 +22,18 @@ class DomainError(Exception):
 
 
 class ConflictError(DomainError):
-    def __init__(self, message: str = "版本冲突或终态不可变更"):
+    """409 冲突：携带机器可读的 code 与当前版本号，便于前端区分参数错误并自动恢复。"""
+
+    def __init__(
+        self,
+        message: str = "版本冲突或终态不可变更",
+        *,
+        code: str = "conflict",
+        current_version: int | None = None,
+    ):
         super().__init__(message, status_code=409)
+        self.code = code
+        self.current_version = current_version
 
 
 def _now() -> datetime:
@@ -53,7 +63,10 @@ def _append_event(
         db.flush()
     except IntegrityError as exc:
         db.rollback()
-        raise ConflictError("乐观锁冲突：expected_version 与当前 version 不一致") from exc
+        raise ConflictError(
+            "乐观锁冲突：并发写入导致 expected_version 与当前 version 不一致",
+            code="version_conflict",
+        ) from exc
     except Exception:
         db.rollback()
         raise
@@ -132,7 +145,11 @@ def _require_running(proj: RunProjection | None) -> RunProjection:
     if proj is None:
         raise DomainError("Run 不存在", status_code=404)
     if proj.status in TERMINAL_STATUSES:
-        raise ConflictError("Run 已处于终态，不可再接受命令")
+        raise ConflictError(
+            "Run 已处于终态，不可再接受命令",
+            code="terminal_state",
+            current_version=proj.version,
+        )
     if proj.status != "running":
         raise DomainError(f"当前状态 {proj.status} 不允许该命令")
     return proj
@@ -142,7 +159,9 @@ def _check_expected_version(proj: RunProjection | None, expected_version: int) -
     current = 0 if proj is None else proj.version
     if expected_version != current:
         raise ConflictError(
-            f"乐观锁冲突：expected_version={expected_version}, current_version={current}"
+            f"乐观锁冲突：expected_version={expected_version}, current_version={current}",
+            code="version_conflict",
+            current_version=current,
         )
 
 
@@ -159,11 +178,15 @@ def start_run(
     run_id: UUID | None = None,
 ) -> RunProjection:
     if expected_version != 0:
-        raise ConflictError("新建 Run 的 expected_version 必须为 0")
+        raise ConflictError(
+            "新建 Run 的 expected_version 必须为 0",
+            code="version_conflict",
+            current_version=0,
+        )
 
     aggregate_id = run_id or uuid4()
     if _get_projection(db, aggregate_id) is not None:
-        raise ConflictError("Run 已存在")
+        raise ConflictError("Run 已存在", code="already_exists")
 
     event = _append_event(
         db,

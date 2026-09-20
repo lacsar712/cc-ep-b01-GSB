@@ -60,6 +60,18 @@
       </div>
     </div>
 
+    <n-alert
+      v-if="conflict"
+      type="warning"
+      closable
+      style="margin-bottom: 16px"
+      @close="conflict = null"
+    >
+      <template #header>版本冲突：数据已被他人更新（非参数错误）</template>
+      {{ conflict.message }}。已自动刷新投影版本：v{{ conflict.staleVersion }} → v{{ conflict.currentVersion }}，
+      表单内容已保留，确认后可直接重新提交。
+    </n-alert>
+
     <div v-if="canWrite" class="card">
       <h3 style="margin-top: 0">命令操作区（乐观锁 expected_version = {{ run.version }}）</h3>
       <div class="grid-2">
@@ -92,7 +104,10 @@
         <n-button type="warning" :loading="busy" @click="doAbort">AbortRun</n-button>
       </div>
     </div>
-    <div v-else class="card muted">审计员只读：可查看事件与血缘，不可发送命令。</div>
+    <div v-else class="card muted">
+      <span v-if="auth.role !== 'researcher'">审计员只读：可查看事件与血缘，不可发送命令。</span>
+      <span v-else>Run 已处于终态（{{ statusLabel }}），不可再接受命令。</span>
+    </div>
   </div>
 </template>
 
@@ -114,6 +129,7 @@ const auth = useAuthStore()
 const message = useMessage()
 const run = ref(null)
 const busy = ref(false)
+const conflict = ref(null)
 const completeSummary = ref('')
 const abortReason = ref('')
 
@@ -163,10 +179,23 @@ async function withBusy(fn) {
   busy.value = true
   try {
     await fn()
+    conflict.value = null
     message.success('命令已接受')
     await load()
   } catch (e) {
-    message.error(e.message || '命令失败')
+    if (e.isConflict) {
+      // 版本冲突（区别于参数错误）：自动刷新投影版本号，保留表单供研究员带新版本再提交
+      const staleVersion = run.value?.version
+      await load().catch(() => {})
+      conflict.value = {
+        message: e.message || '版本冲突',
+        staleVersion,
+        currentVersion: run.value?.version ?? e.currentVersion,
+      }
+      message.warning('版本冲突：已自动刷新到最新版本，请确认后重新提交')
+    } else {
+      message.error(e.message || '命令失败')
+    }
   } finally {
     busy.value = false
   }

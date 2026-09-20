@@ -64,8 +64,9 @@ pytest -q
 6. 打开「血缘」确认 code_commit、dataset 指纹、artifacts、metrics
 7. 健康检查：`GET http://localhost:8173/api/health`
 8. 用 `auditor` 登录：可看列表/事件/血缘，命令按钮不可用
+9. 并发冲突恢复：两个窗口打开同一条进行中 Run 的详情页，先后提交写命令 —— 后到者看到黄色「版本冲突」提示（区别于红色参数错误），投影版本号已自动刷新，表单保留，直接再次提交即成功
 
-终态或 `expected_version` 不匹配时，API 返回 **409**。
+终态或 `expected_version` 不匹配时，API 返回 **409**，且 `detail` 为结构化对象 `{code, message, current_version}`（`code` ∈ `version_conflict` / `terminal_state` / `already_exists`），与参数错误（422，`detail` 为列表）形态不同；详情页凭此区分冲突与参数错误，并自动刷新投影版本号供重试。
 
 ## 架构要点
 
